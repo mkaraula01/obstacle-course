@@ -1,23 +1,64 @@
-name: Release builds (Android + macOS + Windows + Linux)
+name: Auto-version release
 
-# Cut a release by pushing a version tag, e.g.:
-#   git tag v0.3.0 && git push origin v0.3.0
-# Each platform job builds and uploads its installers as a workflow artifact;
-# a final job collects them all and publishes ONE GitHub Release. (Having every
-# job write the release directly races and randomly drops an asset.)
+# Every push to main auto-bumps the patch version, tags it, and publishes a new
+# GitHub Release with all native installers. The bump/tag/build/publish all run
+# in THIS workflow run (no PAT needed) — the bot's bump commit carries
+# "[skip ci]" so it doesn't loop, and a push with "[skip release]" in the
+# message skips the whole thing.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# Serialize runs so two quick pushes don't race on the version bump/tag.
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
 jobs:
+  version:
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release]') }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Bump patch version, commit and tag
+        id: bump
+        run: |
+          set -e
+          OLD=$(node -e "console.log(require('./package.json').version)")
+          LATEST=$(git tag -l 'v*' --sort=-v:refname | head -n1 | sed 's/^v//')
+          BASE=${LATEST:-$OLD}
+          NEW=$(node -e "const v=process.argv[1].split('.'); v[2]=(+v[2]+1); console.log(v.join('.'))" "$BASE")
+          echo "current package.json=$OLD, latest tag=${LATEST:-none} -> new=$NEW"
+          for f in package.json app.json src-tauri/tauri.conf.json; do
+            sed -i "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" "$f"
+          done
+          # Only the two root version fields in the lockfile (first two matches).
+          sed -i "0,/\"version\": \"$OLD\"/s//\"version\": \"$NEW\"/" package-lock.json
+          sed -i "0,/\"version\": \"$OLD\"/s//\"version\": \"$NEW\"/" package-lock.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "release: v$NEW [skip ci]"
+          git tag "v$NEW"
+          git push origin HEAD:main
+          git push origin "v$NEW"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+
   android-apk:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -40,9 +81,12 @@ jobs:
           if-no-files-found: error
 
   macos-dmg:
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -58,6 +102,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    needs: version
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -69,6 +114,8 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -92,8 +139,7 @@ jobs:
           if-no-files-found: error
 
   linux:
-    # Native builds on each arch (cross-compiling Tauri + WebKitGTK is painful).
-    # Built on 22.04 for broad glibc compatibility with older distros.
+    needs: version
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -105,6 +151,8 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -135,11 +183,13 @@ jobs:
 
   release:
     # Single writer: collect every platform's artifacts and publish one Release.
-    needs: [android-apk, macos-dmg, windows, linux]
-    if: always()
+    needs: [version, android-apk, macos-dmg, windows, linux]
+    if: ${{ always() && needs.version.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -148,6 +198,7 @@ jobs:
         run: ls -lhR artifacts
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.tag }}
           files: artifacts/**/*
           body_path: .github/RELEASE_NOTES.md
           fail_on_unmatched_files: false
